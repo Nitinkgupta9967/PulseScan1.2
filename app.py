@@ -86,7 +86,8 @@ def analyze_video(payload: VideoRequest):
         process_start = time.time()
 
         # 👉 IMPORT HERE to avoid startup delays
-        from runner import run_pipeline
+        from pipeline_runner import run_pipeline
+
 
         result = run_pipeline(
             video_path=video_path,
