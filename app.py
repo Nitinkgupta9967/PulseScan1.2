@@ -45,7 +45,7 @@ def root():
 
 # ---------------- Analyze Endpoint ---------------- #
 
-@app.post("/analyze-video")
+@app.post("/analyze_video")
 def analyze_video(request: VideoRequest):
     request_id = str(uuid.uuid4())[:8]
     start_time = time.time()

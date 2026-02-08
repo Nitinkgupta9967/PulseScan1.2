@@ -3,6 +3,8 @@
 import cv2
 import numpy as np
 import random
+import time
+import logging
 
 from frame_face_validation import single_face_video_check
 from luminance_analysis import luminance_analysis
@@ -16,6 +18,7 @@ from vital_signs_calculation import (
 )
 
 FS = 30  # Frames per second
+logger = logging.getLogger("PulseScan")
 
 
 # ---------------- Utility Functions ---------------- #
@@ -46,18 +49,30 @@ def compute_snr(signal):
 
 
 def generate_hr_trend(hr, length=30):
-    """Generate realistic HR trend around measured HR"""
     return [round(hr + random.uniform(-2, 2), 1) for _ in range(length)]
 
 
 def generate_rr_trend(rr, length=30):
-    """Generate realistic RR trend around measured RR"""
     return [round(rr + random.uniform(-1, 1), 1) for _ in range(length)]
 
 
 # ---------------- Main Pipeline ---------------- #
 
-def run_pipeline(video_path):
+def run_pipeline(
+    video_path: str,
+    request_id: str | None = None,
+    timeout: int = 300
+):
+    start_time = time.time()
+
+    def log(msg):
+        if request_id:
+            logger.info(f"[{request_id}] {msg}")
+        else:
+            logger.info(msg)
+
+    log("Pipeline started")
+
     # ---------- Open video ----------
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -65,6 +80,8 @@ def run_pipeline(video_path):
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
+
+    log(f"Total frames detected: {total_frames}")
 
     if total_frames < 60:
         raise ValueError("Video too short for analysis")
@@ -75,6 +92,8 @@ def run_pipeline(video_path):
             "Video quality check failed "
             "(lighting / face / ROI requirements not met)"
         )
+
+    log("Single-face & quality validation passed")
 
     # ---------- Signal extraction ----------
     cap = cv2.VideoCapture(video_path)
@@ -87,21 +106,24 @@ def run_pipeline(video_path):
         if not ret:
             break
 
-        # Lighting check
         if not luminance_analysis(frame):
             continue
 
-        # Face + ROI check
         rois = extract_face_rois(frame)
         if rois is None:
             continue
 
-        # Extract raw BVP (green-channel mean)
         bvp_value = np.mean(extract_frame_bvp(rois))
         bvp_raw.append(bvp_value)
         usable_frames += 1
 
+        # Optional timeout guard
+        if time.time() - start_time > timeout:
+            raise TimeoutError("Processing exceeded time limit")
+
     cap.release()
+
+    log(f"Usable frames: {usable_frames}")
 
     if len(bvp_raw) < FS * 5:
         raise ValueError("Insufficient valid frames for signal extraction")
@@ -110,12 +132,16 @@ def run_pipeline(video_path):
     bvp_raw = np.array(bvp_raw)
     bvp_filtered = bandpass_filter(bvp_raw, FS)
 
+    log("BVP signal filtered")
+
     # ---------- Vital calculations (REAL) ----------
     hr = calculate_heart_rate(bvp_filtered, FS)
     rr = calculate_respiration_rate(bvp_filtered, FS)
 
     if hr is None or rr is None:
         raise ValueError("Physiological signals not reliable")
+
+    log(f"Vitals calculated | HR={hr:.2f}, RR={rr:.2f}")
 
     # ---------- SpO2 (SIMULATED, nominal) ----------
     spo2 = generate_nominal_spo2()
@@ -124,12 +150,13 @@ def run_pipeline(video_path):
     snr = compute_snr(bvp_filtered)
     usable_percent = round((usable_frames / total_frames) * 100, 2)
 
-    # HR statistics (in BPM, NOT signal amplitude)
     hr_min = round(hr - 5, 1)
     hr_max = round(hr + 5, 1)
 
-    # ---------- Chart data limits ----------
     chart_limit = min(300, len(bvp_filtered))
+
+    elapsed = round(time.time() - start_time, 2)
+    log(f"Pipeline completed in {elapsed} sec")
 
     # ---------- Final API Response ----------
     return {
@@ -148,11 +175,8 @@ def run_pipeline(video_path):
         },
 
         "charts": {
-            # True signal waveforms (for line plots)
             "bvp_raw": bvp_raw[:chart_limit].tolist(),
             "bvp_filtered": bvp_filtered[:chart_limit].tolist(),
-
-            # Unit-correct trends (for dashboards)
             "heart_rate_trend": generate_hr_trend(hr),
             "respiration_trend": generate_rr_trend(rr)
         },
