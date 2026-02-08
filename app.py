@@ -1,106 +1,135 @@
-# app.py
-
-import time
-import uuid
-import logging
-import tempfile
-import requests
 import os
+import uuid
+import time
+import logging
+import requests
+import tempfile
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from pipeline_runner import run_pipeline
-
-# ---------------- Logging Setup ---------------- #
-
+# =========================
+# LOGGING CONFIG
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
 logger = logging.getLogger("PulseScan")
 
-# ---------------- FastAPI App ---------------- #
-
+# =========================
+# FASTAPI APP
+# =========================
 app = FastAPI(
     title="PulseScan API",
-    description="Video-based rPPG Vital Signs Extraction",
+    description="Remote rPPG-based vital extraction",
     version="1.0"
 )
 
-# ---------------- Request Model ---------------- #
-
+# =========================
+# REQUEST MODEL
+# =========================
 class VideoRequest(BaseModel):
     video_url: str
 
-# ---------------- Root Endpoint ---------------- #
-
+# =========================
+# ROOT ENDPOINT
+# =========================
 @app.get("/")
 def root():
-    return {
-        "status": "PulseScan API running",
-        "docs": "/docs"
-    }
+    return {"status": "OK", "message": "PulseScan API is running"}
 
-# ---------------- Analyze Endpoint ---------------- #
-
-@app.post("/analyze")
-def analyze_video(request: VideoRequest):
+# =========================
+# MAIN ANALYSIS ENDPOINT
+# =========================
+@app.post("/analyze-video")
+def analyze_video(payload: VideoRequest):
     request_id = str(uuid.uuid4())[:8]
-    start_time = time.time()
+    api_start = time.time()
 
     logger.info(f"[{request_id}] Request received")
-    logger.info(f"[{request_id}] Video URL: {request.video_url}")
+    logger.info(f"[{request_id}] Video URL: {payload.video_url}")
 
+    # -------------------------
+    # 1. DOWNLOAD VIDEO
+    # -------------------------
     try:
-        # ---------- Download Video ----------
+        dl_start = time.time()
         logger.info(f"[{request_id}] Starting video download")
-        download_start = time.time()
 
-        response = requests.get(request.video_url, stream=True, timeout=60)
-
+        response = requests.get(payload.video_url, stream=True, timeout=30)
         if response.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to download video")
+            raise Exception("Video download failed")
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
-                    temp_video.write(chunk)
-            video_path = temp_video.name
+                    tmp.write(chunk)
+            video_path = tmp.name
 
-        download_end = time.time()
         logger.info(
-            f"[{request_id}] Video download completed "
-            f"in {round(download_end - download_start, 2)} sec"
+            f"[{request_id}] Video download completed in "
+            f"{round(time.time() - dl_start, 2)} sec"
         )
-
-        # ---------- Processing ----------
-        logger.info(f"[{request_id}] Starting rPPG processing")
-        processing_start = time.time()
-
-        result = run_pipeline(video_path)
-
-        processing_end = time.time()
-        logger.info(
-            f"[{request_id}] rPPG processing completed "
-            f"in {round(processing_end - processing_start, 2)} sec"
-        )
-
-        # ---------- Cleanup ----------
-        if os.path.exists(video_path):
-            os.remove(video_path)
-
-        total_time = time.time() - start_time
-        logger.info(
-            f"[{request_id}] TOTAL request time: {round(total_time, 2)} sec"
-        )
-
-        return result
 
     except Exception as e:
-        total_time = time.time() - start_time
-        logger.error(
-            f"[{request_id}] ERROR after {round(total_time, 2)} sec | {str(e)}"
+        logger.error(f"[{request_id}] Download error: {str(e)}")
+        raise HTTPException(status_code=400, detail="Failed to download video")
+
+    # -------------------------
+    # 2. PROCESS VIDEO
+    # -------------------------
+    try:
+        logger.info(f"[{request_id}] Starting rPPG processing")
+
+        PROCESSING_TIMEOUT = 120  # seconds (adjust if needed)
+        process_start = time.time()
+
+        # 👉 IMPORT HERE to avoid startup delays
+        from runner import run_pipeline
+
+        result = run_pipeline(
+            video_path=video_path,
+            request_id=request_id,
+            start_time=process_start,
+            timeout=PROCESSING_TIMEOUT
         )
-        raise HTTPException(status_code=500, detail=str(e))
+
+        logger.info(
+            f"[{request_id}] Processing completed in "
+            f"{round(time.time() - process_start, 2)} sec"
+        )
+
+    except TimeoutError:
+        logger.error(f"[{request_id}] Processing timeout")
+        raise HTTPException(
+            status_code=408,
+            detail="Processing timeout – video quality unstable or too long"
+        )
+
+    except Exception as e:
+        logger.exception(f"[{request_id}] Processing failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal processing error"
+        )
+
+    finally:
+        # -------------------------
+        # CLEANUP
+        # -------------------------
+        try:
+            os.remove(video_path)
+            logger.info(f"[{request_id}] Temporary file deleted")
+        except Exception:
+            pass
+
+    # -------------------------
+    # 3. RESPONSE
+    # -------------------------
+    logger.info(
+        f"[{request_id}] Total request time "
+        f"{round(time.time() - api_start, 2)} sec"
+    )
+
+    return result
