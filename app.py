@@ -13,6 +13,11 @@ from pydantic import BaseModel
 
 from pipeline_runner import run_pipeline
 
+# ---------------- CONFIG ---------------- #
+
+MAX_PROCESS_SECONDS = 15      # HARD LIMIT
+VIDEO_DOWNLOAD_TIMEOUT = 40
+
 # ---------------- Logging Setup ---------------- #
 
 logging.basicConfig(
@@ -26,8 +31,8 @@ logger = logging.getLogger("PulseScan")
 
 app = FastAPI(
     title="PulseScan API",
-    description="Video-based rPPG Vital Signs Extraction",
-    version="1.0"
+    description="Fast rPPG Vital Signs Extraction (Optimized)",
+    version="1.1"
 )
 
 # ---------------- Request Model ---------------- #
@@ -35,221 +40,139 @@ app = FastAPI(
 class VideoRequest(BaseModel):
     video_url: str
 
-# ---------------- Root Endpoint ---------------- #
+# ---------------- Root ---------------- #
 
 @app.get("/")
 def root():
     return {
         "status": "PulseScan API running",
         "docs": "/docs",
-        "test_endpoints": {
-            "cascade": "/test_cascade",
-            "dependencies": "/test_dependencies",
-            "video_quick_test": "/test_video_quick"
+        "endpoints": {
+            "analyze": "/analyze_video",
+            "quick_test": "/test_video_quick"
         }
     }
 
-# ---------------- Analyze Endpoint ---------------- #
+# ---------------- MAIN ANALYSIS ---------------- #
 
 @app.post("/analyze_video")
 def analyze_video(request: VideoRequest):
     request_id = str(uuid.uuid4())[:8]
-    start_time = time.time()
+    request_start = time.time()
 
     logger.info(f"[{request_id}] Request received")
     logger.info(f"[{request_id}] Video URL: {request.video_url}")
 
+    temp_video_path = None
+
     try:
         # ---------- Download Video ----------
-        logger.info(f"[{request_id}] Starting video download")
+        logger.info(f"[{request_id}] Downloading video")
         download_start = time.time()
 
-        response = requests.get(request.video_url, stream=True, timeout=60)
+        response = requests.get(
+            request.video_url,
+            stream=True,
+            timeout=VIDEO_DOWNLOAD_TIMEOUT
+        )
 
         if response.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to download video")
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to download video"
+            )
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
-                    temp_video.write(chunk)
-            video_path = temp_video.name
+                    tmp.write(chunk)
+            temp_video_path = tmp.name
 
-        download_end = time.time()
         logger.info(
-            f"[{request_id}] Video download completed "
-            f"in {round(download_end - download_start, 2)} sec"
+            f"[{request_id}] Download completed in "
+            f"{round(time.time() - download_start, 2)} sec"
         )
 
-        # ---------- Processing ----------
-        logger.info(f"[{request_id}] Starting rPPG processing")
-        processing_start = time.time()
+        # ---------- Run Pipeline (TIME-BOUND) ----------
+        logger.info(f"[{request_id}] Starting rPPG pipeline")
 
-        result = run_pipeline(video_path)
-
-        processing_end = time.time()
-        logger.info(
-            f"[{request_id}] rPPG processing completed "
-            f"in {round(processing_end - processing_start, 2)} sec"
+        result = run_pipeline(
+            video_path=temp_video_path,
+            timeout=MAX_PROCESS_SECONDS
         )
 
-        # ---------- Cleanup ----------
-        if os.path.exists(video_path):
-            os.remove(video_path)
+        total_time = round(time.time() - request_start, 2)
+        logger.info(f"[{request_id}] SUCCESS | Total time {total_time}s")
 
-        total_time = time.time() - start_time
-        logger.info(
-            f"[{request_id}] TOTAL request time: {round(total_time, 2)} sec"
+        return {
+            "request_id": request_id,
+            "processing_time_sec": total_time,
+            **result
+        }
+
+    except TimeoutError:
+        logger.error(f"[{request_id}] Processing timeout")
+        raise HTTPException(
+            status_code=408,
+            detail="Processing exceeded time limit"
         )
-
-        return result
 
     except Exception as e:
-        total_time = time.time() - start_time
-        logger.error(
-            f"[{request_id}] ERROR after {round(total_time, 2)} sec | {str(e)}"
+        logger.error(f"[{request_id}] ERROR | {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
         )
-        raise HTTPException(status_code=500, detail=str(e))
 
+    finally:
+        if temp_video_path and os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
+            logger.info(f"[{request_id}] Temporary file removed")
 
-# ---------------- Test Endpoints ---------------- #
-
-@app.get("/test_cascade")
-def test_cascade():
-    """Test if face cascade classifier can be loaded"""
-    import cv2
-    
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    exists = os.path.exists(cascade_path)
-    
-    fallback_path = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
-    fallback_exists = os.path.exists(fallback_path)
-    
-    cascade = cv2.CascadeClassifier(cascade_path)
-    loaded = not cascade.empty()
-    
-    return {
-        "opencv_version": cv2.__version__,
-        "primary_cascade": {
-            "path": cascade_path,
-            "exists": exists,
-            "loaded": loaded
-        },
-        "fallback_cascade": {
-            "path": fallback_path,
-            "exists": fallback_exists
-        },
-        "status": "OK" if loaded else "FAILED"
-    }
-
-
-@app.get("/test_dependencies")
-def test_dependencies():
-    """Test if all dependencies are installed"""
-    deps = {}
-    
-    # Test each dependency
-    for dep_name in ['cv2', 'numpy', 'scipy', 'requests']:
-        try:
-            module = __import__(dep_name)
-            version = getattr(module, '__version__', 'unknown')
-            deps[dep_name] = {
-                "installed": True,
-                "version": version
-            }
-        except ImportError as e:
-            deps[dep_name] = {
-                "installed": False,
-                "error": str(e)
-            }
-    
-    return {
-        "python_version": sys.version,
-        "dependencies": deps
-    }
-
+# ---------------- QUICK VIDEO TEST ---------------- #
 
 @app.post("/test_video_quick")
 def test_video_quick(request: VideoRequest):
-    """Quick test to see if video can be downloaded and opened"""
     import cv2
-    
+
     try:
-        # Download
-        logger.info(f"Testing video: {request.video_url}")
-        response = requests.get(request.video_url, stream=True, timeout=30)
+        response = requests.get(
+            request.video_url,
+            stream=True,
+            timeout=20
+        )
+
         if response.status_code != 200:
-            return {"status": "FAILED", "reason": "Download failed", "status_code": response.status_code}
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
+            return {"status": "FAILED", "reason": "Download failed"}
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
-                    temp_video.write(chunk)
-            video_path = temp_video.name
-        
-        # Open video
-        cap = cv2.VideoCapture(video_path)
+                    tmp.write(chunk)
+            path = tmp.name
+
+        cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            os.remove(video_path)
-            return {"status": "FAILED", "reason": "Video file corrupted or invalid format"}
-        
-        # Get info
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            os.remove(path)
+            return {"status": "FAILED", "reason": "Invalid video"}
+
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        # Try to read first frame
+
         ret, frame = cap.read()
-        first_frame_ok = ret
-        
-        # Test luminance on first frame
-        lum_ok = False
-        mean_lum = None
-        if ret:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            mean_lum = float(gray.mean())
-            lum_ok = 50 <= mean_lum <= 200
-        
-        # Test face detection on first frame
-        faces_detected = 0
-        cascade_loaded = False
-        if ret:
-            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            cascade = cv2.CascadeClassifier(cascade_path)
-            cascade_loaded = not cascade.empty()
-            
-            if cascade_loaded:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = cascade.detectMultiScale(gray, 1.2, 5)
-                faces_detected = len(faces)
-        
         cap.release()
-        os.remove(video_path)
-        
+        os.remove(path)
+
         return {
-            "status": "SUCCESS",
-            "video_info": {
-                "total_frames": total_frames,
-                "fps": fps,
-                "resolution": f"{width}x{height}",
-                "duration_seconds": round(total_frames / fps if fps > 0 else 0, 2)
-            },
-            "first_frame": {
-                "readable": first_frame_ok,
-                "mean_luminance": mean_lum,
-                "luminance_ok": lum_ok
-            },
-            "face_detection": {
-                "cascade_loaded": cascade_loaded,
-                "faces_in_first_frame": faces_detected,
-                "detection_ok": faces_detected == 1
-            },
-            "ready_for_processing": first_frame_ok and lum_ok and faces_detected == 1
+            "status": "OK",
+            "total_frames": frames,
+            "fps": fps,
+            "duration_sec": round(frames / fps, 2) if fps else 0,
+            "first_frame_ok": ret,
+            "recommended": "≤ 15 seconds video"
         }
-        
+
     except Exception as e:
-        logger.error(f"Test video error: {str(e)}")
         return {
             "status": "ERROR",
             "error": str(e)
