@@ -1,11 +1,20 @@
 import cv2
+import os
+
+# Load cascade classifier once at module level
+cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+if not os.path.exists(cascade_path):
+    # Fallback path for some installations
+    cascade_path = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+
+face_cascade = cv2.CascadeClassifier(cascade_path)
+
+# Verify cascade loaded successfully
+if face_cascade.empty():
+    raise RuntimeError(f"Failed to load cascade classifier from {cascade_path}")
 
 def extract_face_rois(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
 
     faces = face_cascade.detectMultiScale(gray, 1.2, 5)
 
