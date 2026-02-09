@@ -1,17 +1,31 @@
 import cv2
 import os
+import logging
+
+logger = logging.getLogger("PulseScan")
 
 # Load cascade classifier once at module level
 cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+logger.info(f"Attempting to load cascade from: {cascade_path}")
+
 if not os.path.exists(cascade_path):
-    # Fallback path for some installations
+    logger.warning(f"Cascade not found at {cascade_path}, trying fallback")
     cascade_path = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+
+if not os.path.exists(cascade_path):
+    logger.error(f"Cascade not found at fallback path either: {cascade_path}")
+else:
+    logger.info(f"Cascade file exists at: {cascade_path}")
 
 face_cascade = cv2.CascadeClassifier(cascade_path)
 
 # Verify cascade loaded successfully
 if face_cascade.empty():
-    raise RuntimeError(f"Failed to load cascade classifier from {cascade_path}")
+    error_msg = f"Failed to load cascade classifier from {cascade_path}"
+    logger.error(error_msg)
+    raise RuntimeError(error_msg)
+else:
+    logger.info("✅ Face cascade classifier loaded successfully")
 
 def extract_face_rois(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
